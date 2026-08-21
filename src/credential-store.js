@@ -1,3 +1,7 @@
+import { readFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
 const PROVIDER = 'openai-codex'
 
 const abortIfNeeded = options => options?.signal?.throwIfAborted()
@@ -27,6 +31,45 @@ function parseOAuthCredential(value) {
   } catch (error) {
     if (error?.message === 'Codex credential store received a malformed OAuth credential') throw error
     throw new Error('Codex credential store contains malformed OAuth JSON', { cause: error })
+  }
+}
+
+function localCodexAuthPath() {
+  const home = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex')
+  return join(home, 'auth.json')
+}
+
+function tokenExpiry(token) {
+  const encoded = token.split('.')[1]
+  if (encoded === undefined) return 0
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'))
+    return typeof payload.exp === 'number' && Number.isFinite(payload.exp) ? payload.exp * 1_000 : 0
+  } catch {
+    return 0
+  }
+}
+
+/** Read the OAuth fields written by the local Codex CLI without exposing them. */
+export async function readLocalCodexCredential(options = {}) {
+  abortIfNeeded(options)
+  let data
+  try {
+    data = JSON.parse(await readFile(options.path ?? localCodexAuthPath(), 'utf8'))
+  } catch (error) {
+    if (error?.code === 'ENOENT') return undefined
+    throw new Error('Could not read local Codex login', { cause: error })
+  }
+  const tokens = data?.tokens
+  if (typeof tokens?.access_token !== 'string' || tokens.access_token.length === 0
+    || typeof tokens.refresh_token !== 'string' || tokens.refresh_token.length === 0
+    || typeof tokens.account_id !== 'string' || tokens.account_id.length === 0) return undefined
+  return {
+    type: 'oauth',
+    access: tokens.access_token,
+    refresh: tokens.refresh_token,
+    expires: tokenExpiry(tokens.access_token),
+    accountId: tokens.account_id,
   }
 }
 
@@ -84,8 +127,27 @@ export class DshOAuthCredentialStore {
     return parseOAuthCredential(hit.value)
   }
 
+  async #importLocal(options) {
+    abortIfNeeded(options)
+    const current = await this.credentials.resolve(this.ref)
+    if (current?.value !== undefined && current.value !== '') return false
+    for (const legacyRef of this.legacyRefs) {
+      const legacy = await this.credentials.resolve(legacyRef)
+      if (legacy?.value !== undefined && legacy.value !== '') return false
+    }
+    const credential = await readLocalCodexCredential(options)
+    if (credential === undefined) return false
+    await this.credentials.set(this.ref, JSON.stringify(assertOAuthCredential(credential)))
+    abortIfNeeded(options)
+    return true
+  }
+
   read(providerId, options) {
     return this.#enqueue(providerId, () => this.#read(providerId, options), options)
+  }
+
+  importLocal(options) {
+    return this.#enqueue(PROVIDER, () => this.#importLocal(options), options)
   }
 
   async list(options) {

@@ -12,6 +12,8 @@ test('client is one removable DSH settings section, not a second application she
   assert.doesNotMatch(source, /wsl043/iu)
   assert.match(source, /login\/start/)
   assert.match(source, /login\/status/)
+  assert.match(source, /local-auth\/import/)
+  assert.match(source, /localLogin/)
   assert.match(source, /['"]usage['"]/)
   assert.doesNotMatch(source, /['"]cache['"]|CacheDiagnostics|CodexCacheTelemetry/)
   assert.doesNotMatch(source, /createRoot|ReactDOM|index\.html|localStorage|sessionStorage|accessToken|refreshToken/)

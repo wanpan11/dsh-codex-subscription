@@ -43,7 +43,7 @@ const publicError = (code, message) => ({
   error: { code, message, details: { issues: [] } },
 })
 
-export function createSubscriptionRpcHandler({ authHandler, usageReader, preferences }) {
+export function createSubscriptionRpcHandler({ authHandler, usageReader, preferences, importLocalAuth }) {
   return async (endpoint, payload, signal) => {
     if (endpoint === 'preferences/status' || endpoint === 'preferences/update') {
       try {
@@ -93,6 +93,16 @@ export function createSubscriptionRpcHandler({ authHandler, usageReader, prefere
           ? error.message
           : 'Could not read ChatGPT usage'
         return publicError('internal', message)
+      }
+    }
+    if (endpoint === 'local-auth/import') {
+      try {
+        signal.throwIfAborted()
+        await importLocalAuth({ signal })
+        return await authHandler('status', {}, signal)
+      } catch (error) {
+        if (signal.aborted) throw error
+        return publicError('internal', 'Could not import local Codex login')
       }
     }
     const result = await authHandler(endpoint, payload, signal)
@@ -222,6 +232,7 @@ export function apply(ctx) {
     authHandler: createCodexRpcHandler(coordinator, { openExternal: openCodexAuthUrl }),
     usageReader,
     preferences,
+    importLocalAuth: options => store.importLocal(options),
   })
 
   ctx.effect(
@@ -230,7 +241,7 @@ export function apply(ctx) {
   )
 }
 
-export { createCodexAuthService, DshOAuthCredentialStore } from './credential-store.js'
+export { createCodexAuthService, DshOAuthCredentialStore, readLocalCodexCredential } from './credential-store.js'
 export { assertCodexAuthUrl, commandForCodexAuthUrl, openCodexAuthUrl } from './external-url.js'
 export { CodexLoginCoordinator, createCodexRpcHandler } from './login-coordinator.js'
 export { CODEX_USAGE_URL, createCodexUsageReader, parseCodexUsage } from './usage.js'

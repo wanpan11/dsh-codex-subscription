@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 
-import { createCodexAuthService, DshOAuthCredentialStore } from '../src/credential-store.js'
+import { createCodexAuthService, DshOAuthCredentialStore, readLocalCodexCredential } from '../src/credential-store.js'
 import { assertCodexAuthUrl, commandForCodexAuthUrl } from '../src/external-url.js'
 import { CodexLoginCoordinator, createCodexRpcHandler } from '../src/login-coordinator.js'
 
@@ -52,6 +55,26 @@ test('credential adapter stores one opaque OAuth object and redacts status', asy
     expiresAt: oauth('one').expires,
   })
   assert.doesNotMatch(JSON.stringify(status), /access-one|refresh-one|account-local/)
+})
+
+test('local Codex auth can be imported without exposing token fields', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-codex-'))
+  const path = join(directory, 'auth.json')
+  try {
+    await writeFile(path, JSON.stringify({ tokens: {
+      access_token: 'local-access', refresh_token: 'local-refresh', account_id: 'local-account',
+    } }))
+    const credential = await readLocalCodexCredential({ path })
+    assert.deepEqual(credential, {
+      type: 'oauth', access: 'local-access', refresh: 'local-refresh', expires: 0, accountId: 'local-account',
+    })
+    const backend = memoryCredentials()
+    const store = new DshOAuthCredentialStore(backend, 'CODEX_OAUTH')
+    assert.equal(await store.importLocal({ path }), true)
+    assert.deepEqual(JSON.parse(backend.readRaw()), credential)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
 })
 
 test('credential refreshes are serialized and cannot overwrite newer rotation', async () => {

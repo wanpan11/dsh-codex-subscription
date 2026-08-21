@@ -29,7 +29,7 @@ const zh = {
   nav: 'Codex 订阅',
   title: 'Codex 订阅',
   connected: '已登录', disconnected: '未登录', accountLoading: '正在读取账户状态…',
-  browserLogin: '浏览器登录', deviceLogin: '设备代码登录', logout: '退出登录',
+  browserLogin: '浏览器登录', deviceLogin: '设备代码登录', localLogin: '使用本地 Codex 登录', localLoginUnavailable: '未找到本地 Codex 登录态。', logout: '退出登录',
   cancel: '取消', submit: '提交授权码', openLogin: '打开登录页',
   manualCode: '若浏览器回调没有自动完成，请粘贴授权码或完整重定向地址。',
   deviceHint: '在登录页输入此设备代码：', waiting: '正在等待登录完成…',
@@ -62,7 +62,7 @@ const en = {
   nav: 'Codex',
   title: 'Codex subscription',
   connected: 'Signed in', disconnected: 'Not signed in', accountLoading: 'Reading account status…',
-  browserLogin: 'Browser sign-in', deviceLogin: 'Device-code sign-in', logout: 'Sign out',
+  browserLogin: 'Browser sign-in', deviceLogin: 'Device-code sign-in', localLogin: 'Use local Codex sign-in', localLoginUnavailable: 'No local Codex sign-in was found.', logout: 'Sign out',
   cancel: 'Cancel', submit: 'Submit authorization code', openLogin: 'Open sign-in page',
   manualCode: 'If the browser callback did not finish automatically, paste the code or full redirect URL.',
   deviceHint: 'Enter this device code on the sign-in page:', waiting: 'Waiting for sign-in to finish…',
@@ -641,6 +641,19 @@ function AccountCard({ rpc, t, account, setAccount, onSignedOut }) {
     void call('login/start', { method, openExternal: true }).then(setFlow)
       .catch(() => setError(t('failed'))).finally(() => setBusy(false))
   }
+  const importLocal = () => {
+    setBusy(true); setError(undefined)
+    void call('local-auth/import').then(next => {
+      setAccount(next)
+      setFlow(undefined)
+      if (next?.authenticated !== true) {
+        setError(t('localLoginUnavailable'))
+        return
+      }
+      onSignedOut()
+      notifyQuickQuota()
+    }).catch(() => setError(t('failed'))).finally(() => setBusy(false))
+  }
   const cancel = () => {
     if (flow?.id === undefined) return
     setBusy(true)
@@ -666,7 +679,7 @@ function AccountCard({ rpc, t, account, setAccount, onSignedOut }) {
   return <div className="codexSubscriptionCard">
     <div className="codexSubscriptionAccountRow">
       <div className="codexSubscriptionStatus" role="status" aria-live="polite"><span className="codexSubscriptionDot" data-state={accountReady ? signedIn ? 'connected' : 'disconnected' : 'loading'} aria-hidden="true" />{accountReady ? signedIn ? t('connected') : t('disconnected') : t('accountLoading')}</div>
-      <div className="codexSubscriptionActions">{signedIn ? <Button type="button" variant="outline" disabled={busy} onClick={logout}>{t('logout')}</Button> : accountReady && (flow === undefined || ['failed', 'cancelled'].includes(flow.phase)) ? <><Button type="button" variant="primary" disabled={busy} onClick={() => begin('browser')}>{t('browserLogin')}</Button><Button type="button" variant="outline" disabled={busy} onClick={() => begin('device_code')}>{t('deviceLogin')}</Button></> : null}</div>
+      <div className="codexSubscriptionActions">{signedIn ? <Button type="button" variant="outline" disabled={busy} onClick={logout}>{t('logout')}</Button> : accountReady && (flow === undefined || ['failed', 'cancelled'].includes(flow.phase)) ? <><Button type="button" variant="primary" disabled={busy} onClick={() => begin('browser')}>{t('browserLogin')}</Button><Button type="button" variant="outline" disabled={busy} onClick={() => begin('device_code')}>{t('deviceLogin')}</Button><Button type="button" variant="outline" disabled={busy} onClick={importLocal}>{t('localLogin')}</Button></> : null}</div>
     </div>
     {!signedIn && flow?.phase === 'waiting_device' ? <div className="codexSubscriptionFlow"><p>{t('deviceHint')}</p><code className="codexSubscriptionCode">{flow.deviceCode?.userCode}</code><a href={flow.deviceCode?.verificationUri} target="_blank" rel="noreferrer">{t('openLogin')}</a><p>{t('waiting')}</p></div> : null}
     {!signedIn && flow?.phase === 'waiting_input' ? <form className="codexSubscriptionFlow" onSubmit={submit}><p>{t('manualCode')}</p><Input className="codexSubscriptionInput" value={manualCode} onChange={event => setManualCode(event.currentTarget.value)} autoComplete="off" spellCheck={false} /><div className="codexSubscriptionActions"><Button type="submit" variant="primary" disabled={busy || manualCode.trim() === ''}>{t('submit')}</Button><Button type="button" variant="outline" disabled={busy} onClick={cancel}>{t('cancel')}</Button></div></form> : null}

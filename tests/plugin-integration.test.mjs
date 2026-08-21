@@ -176,6 +176,21 @@ test('usage failures use a DSH-supported bounded RPC error', async () => {
   assert.doesNotMatch(JSON.stringify(result), /host secret/)
 })
 
+test('local auth import returns only the public account status', async () => {
+  let imported = false
+  const handler = plugin.createSubscriptionRpcHandler({
+    async authHandler(endpoint) {
+      assert.equal(endpoint, 'status')
+      return { ok: true, value: { authenticated: imported, provider: 'openai-codex' } }
+    },
+    usageReader: { async read() { throw new Error('not used') }, clear() {} },
+    importLocalAuth: async () => { imported = true },
+  })
+  const result = await handler('local-auth/import', {}, new AbortController().signal)
+  assert.deepEqual(result, { ok: true, value: { authenticated: true, provider: 'openai-codex' } })
+  assert.doesNotMatch(JSON.stringify(result), /access|refresh|accountId/)
+})
+
 test('unknown browser search preferences fail safe to the DSH default', () => {
   assert.equal(normalizeSearchProvider(SEARCH_PROVIDER_DSH), SEARCH_PROVIDER_DSH)
   assert.equal(normalizeSearchProvider(SEARCH_PROVIDER_CODEX), SEARCH_PROVIDER_CODEX)
