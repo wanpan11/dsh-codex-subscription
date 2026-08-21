@@ -13,6 +13,7 @@ import {
 } from './pi-ai-runtime.js'
 import { CODEX_SEARCH_PROVIDER_ID, createCodexSearchProvider } from './codex-search.js'
 import { createCodexImageTool } from './codex-images.js'
+import { createSubscriptionDiagnostics } from './diagnostics.js'
 import {
   DEFAULT_QUICK_QUOTA_VISIBLE,
   DEFAULT_SEARCH_PROVIDER,
@@ -43,8 +44,17 @@ const publicError = (code, message) => ({
   error: { code, message, details: { issues: [] } },
 })
 
-export function createSubscriptionRpcHandler({ authHandler, usageReader, preferences, importLocalAuth }) {
+export function createSubscriptionRpcHandler({ authHandler, usageReader, preferences, importLocalAuth, diagnosticsReader }) {
   return async (endpoint, payload, signal) => {
+    if (endpoint === 'diagnostics') {
+      try {
+        signal.throwIfAborted()
+        return { ok: true, value: await diagnosticsReader() }
+      } catch (error) {
+        if (signal.aborted) throw error
+        return publicError('internal', 'Could not create support diagnostics')
+      }
+    }
     if (endpoint === 'preferences/status' || endpoint === 'preferences/update') {
       try {
         signal.throwIfAborted()
@@ -233,6 +243,7 @@ export function apply(ctx) {
     usageReader,
     preferences,
     importLocalAuth: options => store.importLocal(options),
+    diagnosticsReader: () => createSubscriptionDiagnostics({ auth, preferences }),
   })
 
   ctx.effect(
@@ -242,6 +253,7 @@ export function apply(ctx) {
 }
 
 export { createCodexAuthService, DshOAuthCredentialStore, readLocalCodexCredential } from './credential-store.js'
+export { createSubscriptionDiagnostics } from './diagnostics.js'
 export { assertCodexAuthUrl, commandForCodexAuthUrl, openCodexAuthUrl } from './external-url.js'
 export { CodexLoginCoordinator, createCodexRpcHandler } from './login-coordinator.js'
 export { CODEX_USAGE_URL, createCodexUsageReader, parseCodexUsage } from './usage.js'

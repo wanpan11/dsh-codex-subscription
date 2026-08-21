@@ -15,6 +15,7 @@ import {
   supportsCodexFastMode,
 } from './settings-contract.js'
 import { selectModelQuota } from './sidebar-quota.js'
+import { readLoginProgress } from './login-progress.js'
 
 export const inject = [
   'slots', 'locale', 'connection', 'remote', 'settingsScope', 'modelDirectories', 'conversation', 'sessions',
@@ -34,6 +35,7 @@ const zh = {
   manualCode: '若浏览器回调没有自动完成，请粘贴授权码或完整重定向地址。',
   deviceHint: '在登录页输入此设备代码：', waiting: '正在等待登录完成…',
   failed: '登录失败，请重试。', loadFailed: '无法读取账户状态。', accountRetry: '重试',
+  diagnostics: '支持诊断', diagnosticsHint: '生成不含凭据、账号标识和授权时间的诊断信息。', diagnosticsLoad: '生成诊断', diagnosticsCopy: '复制诊断', diagnosticsCopied: '已复制', diagnosticsFailed: '无法生成诊断信息。',
   searchTitle: '搜索来源',
   searchDsh: 'DSH 默认', searchDshHint: '当前搜索服务',
   searchCodex: 'Codex 订阅', searchCodexHint: 'ChatGPT 订阅搜索',
@@ -67,6 +69,7 @@ const en = {
   manualCode: 'If the browser callback did not finish automatically, paste the code or full redirect URL.',
   deviceHint: 'Enter this device code on the sign-in page:', waiting: 'Waiting for sign-in to finish…',
   failed: 'Sign-in failed. Try again.', loadFailed: 'Could not read account status.', accountRetry: 'Retry',
+  diagnostics: 'Support diagnostics', diagnosticsHint: 'Create a report without credentials, account identifiers, or authorization timestamps.', diagnosticsLoad: 'Create report', diagnosticsCopy: 'Copy report', diagnosticsCopied: 'Copied', diagnosticsFailed: 'Could not create diagnostics.',
   searchTitle: 'Search source',
   searchDsh: 'DSH default', searchDshHint: 'Current search service',
   searchCodex: 'Codex subscription', searchCodexHint: 'ChatGPT subscription search',
@@ -107,6 +110,7 @@ const STYLE = `
 .codexSubscriptionFlow p{font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary)}.codexSubscriptionCode{width:max-content;max-width:100%;font:600 16px/22px ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.08em;overflow-wrap:anywhere}
 .codexSubscriptionError{font-size:13px;line-height:20px;color:var(--dsw-alias-state-error-primary)}.codexSubscriptionInput{width:100%;box-sizing:border-box}
 .codexSubscriptionRecover{display:flex;align-items:center;justify-content:space-between;gap:12px}.codexSubscriptionRecover .codexSubscriptionError{flex:1}.codexSubscriptionRecover button{flex:0 0 auto}
+.codexSubscriptionDiagnostics pre{max-height:240px;margin:0;padding:10px 12px;border-radius:8px;background:var(--dsw-alias-bg-module-platform);overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:11px/17px ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--dsw-alias-label-secondary)}
 .codexSubscriptionSectionTitle{display:flex;flex:1;min-width:0;flex-direction:column;gap:2px}.codexSubscriptionFreshness{font-size:11px;line-height:17px;color:var(--dsw-alias-label-tertiary)}
 .codexSubscriptionRefresh{flex:0 0 auto;min-width:72px;width:max-content;white-space:nowrap!important;word-break:keep-all!important;overflow-wrap:normal!important;writing-mode:horizontal-tb!important}.codexSubscriptionRefresh *{white-space:nowrap!important;word-break:keep-all!important;writing-mode:horizontal-tb!important}
 .codexSubscriptionEmpty{padding:18px;border:1px dashed var(--dsw-alias-border-l3);border-radius:10px;text-align:center;font-size:13px;line-height:20px;color:var(--dsw-alias-label-tertiary)}
@@ -625,12 +629,17 @@ function AccountCard({ rpc, t, account, setAccount, onSignedOut }) {
   useEffect(() => {
     if (flow?.id === undefined || ['authenticated', 'failed', 'cancelled'].includes(flow.phase)) return undefined
     const timer = window.setInterval(() => {
-      void call('login/status', { id: flow.id }).then(next => {
-        setFlow(next)
-        if (next.phase === 'authenticated') void call('status').then(account => {
-          setAccount(account)
+      void readLoginProgress({
+        flow,
+        readFlow: () => call('login/status', { id: flow.id }),
+        readAccount: () => call('status'),
+      }).then(next => {
+        setFlow(next.flow)
+        setError(undefined)
+        if (next.account !== undefined) {
+          setAccount(next.account)
           notifyQuickQuota()
-        })
+        }
       }).catch(() => setError(t('failed')))
     }, 800)
     return () => window.clearInterval(timer)
@@ -657,7 +666,17 @@ function AccountCard({ rpc, t, account, setAccount, onSignedOut }) {
   const cancel = () => {
     if (flow?.id === undefined) return
     setBusy(true)
-    void call('login/cancel', { id: flow.id }).then(setFlow).finally(() => setBusy(false))
+    void call('login/cancel', { id: flow.id }).then(next => {
+      setFlow(next)
+      return call('status').then(account => {
+        if (account.authenticated === true) {
+          setAccount(account)
+          setFlow({ ...next, phase: 'authenticated', authenticated: true })
+          setError(undefined)
+          notifyQuickQuota()
+        }
+      })
+    }).catch(() => setError(t('failed'))).finally(() => setBusy(false))
   }
   const submit = event => {
     event.preventDefault()
@@ -692,6 +711,30 @@ function AccountFailureCard({ retry, t }) {
   return <div className="codexSubscriptionCard codexSubscriptionRecover" role="alert">
     <p className="codexSubscriptionError">{t('loadFailed')}</p>
     <Button type="button" variant="outline" onClick={retry}>{t('accountRetry')}</Button>
+  </div>
+}
+
+function DiagnosticsCard({ rpc, t }) {
+  const [report, setReport] = useState()
+  const [busy, setBusy] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const [error, setError] = useState(false)
+  const load = () => {
+    setBusy(true); setError(false); setCopied(false)
+    void rpc.call(CHANNEL, 'diagnostics', {}).then(unwrap).then(setReport)
+      .catch(() => setError(true)).finally(() => setBusy(false))
+  }
+  const copy = () => {
+    if (report === undefined) return
+    void navigator.clipboard.writeText(JSON.stringify(report, null, 2)).then(() => setCopied(true)).catch(() => setError(true))
+  }
+  return <div className="codexSubscriptionCard codexSubscriptionDiagnostics">
+    <div className="codexSubscriptionSectionHead">
+      <div className="codexSubscriptionSectionTitle"><h3>{t('diagnostics')}</h3><p className="codexSubscriptionNote">{t('diagnosticsHint')}</p></div>
+      <div className="codexSubscriptionActions"><Button type="button" variant="outline" disabled={busy} onClick={load}>{t('diagnosticsLoad')}</Button>{report === undefined ? null : <Button type="button" variant="outline" onClick={copy}>{copied ? t('diagnosticsCopied') : t('diagnosticsCopy')}</Button>}</div>
+    </div>
+    {report === undefined ? null : <pre>{JSON.stringify(report, null, 2)}</pre>}
+    {error ? <p className="codexSubscriptionError" role="alert">{t('diagnosticsFailed')}</p> : null}
   </div>
 }
 
@@ -789,6 +832,7 @@ function CodexSection({ preference, rpc, t }) {
     {accountError === undefined ? <AccountCard rpc={rpc} t={t} account={account} setAccount={setAccount} onSignedOut={() => setResetKey(value => value + 1)} /> : <AccountFailureCard retry={loadAccount} t={t} />}
     <PreferencesCard preference={preference} t={t} />
     {account === undefined ? null : <UsageCard rpc={rpc} t={t} signedIn={account.authenticated === true} resetKey={resetKey} />}
+    <DiagnosticsCard rpc={rpc} t={t} />
   </section>
 }
 
