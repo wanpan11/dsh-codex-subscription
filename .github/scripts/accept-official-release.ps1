@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string] $PackagePath,
-    [string] $DshVersion = '0.1.1-rc.1',
+    [string] $DshVersion = '0.1.5-rc.1',
     [string] $Profile = 'web',
     [ValidateSet('npx', 'pnpm')][string] $DshRunner = 'npx',
     [int] $StartupTimeoutSeconds = 45
@@ -9,25 +9,64 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $package = (Resolve-Path -LiteralPath $PackagePath).Path
+$acceptanceRoot = Join-Path ([IO.Path]::GetTempPath()) ('dsh-codex-official-' + [Guid]::NewGuid().ToString('N'))
+$previousDshHome = $env:DSH_HOME
+$env:DSH_HOME = Join-Path $acceptanceRoot 'dsh-home'
+New-Item -ItemType Directory -Path $acceptanceRoot | Out-Null
 $runner = Get-Command $DshRunner -CommandType Application -ErrorAction Stop |
     Select-Object -First 1
 $runnerPrefix = if ($DshRunner -eq 'npx') {
     @('-y', "@deepseek-ai/dsh@$DshVersion")
 } else {
-    # The workflow authenticates this exact DSH version against an immutable
-    # official GitHub release before acceptance. Disable only pnpm's time delay;
-    # dependency, peer, integrity, build, and runtime checks remain enabled.
-    @('--config.minimum-release-age=0', 'dlx', "@deepseek-ai/dsh@$DshVersion")
+    @()
 }
-$acceptanceRoot = Join-Path ([IO.Path]::GetTempPath()) ('dsh-codex-official-' + [Guid]::NewGuid().ToString('N'))
-$previousDshHome = $env:DSH_HOME
-$env:DSH_HOME = Join-Path $acceptanceRoot 'dsh-home'
-New-Item -ItemType Directory -Path $acceptanceRoot | Out-Null
+
+function Initialize-Runner {
+    if ($DshRunner -ne 'pnpm') { return }
+
+    # Materialize the authenticated official package once. Re-resolving pnpm dlx
+    # for every lifecycle command makes registry resets look like plugin failures.
+    $runnerRoot = Join-Path $acceptanceRoot 'runner'
+    New-Item -ItemType Directory -Path $runnerRoot | Out-Null
+    [IO.File]::WriteAllText((Join-Path $runnerRoot 'package.json'), '{"private":true}')
+    # The isolated CI checkout intentionally has no development node_modules.
+    # Materialize the one test-only browser storage emulator beside the runner.
+    $sourceManifest = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../../package.json') -Raw | ConvertFrom-Json
+    $indexedDbVersion = $sourceManifest.devDependencies.'fake-indexeddb'
+    if (-not $indexedDbVersion) { throw 'Missing IndexedDB test dependency version.' }
+    & $runner.Source `
+        --dir $runnerRoot `
+        --config.minimum-release-age=0 `
+        add `
+        --ignore-workspace `
+        --save-exact `
+        '--allow-build=@deepseek-ai/dsh-subprocess-local' `
+        '--allow-build=@google/genai' `
+        '--allow-build=fs-ext' `
+        '--allow-build=koffi' `
+        '--allow-build=node-pty' `
+        '--allow-build=protobufjs' `
+        "@deepseek-ai/dsh@$DshVersion" `
+        "fake-indexeddb@$indexedDbVersion"
+    if ($LASTEXITCODE -ne 0) { throw 'Official DSH runner materialization failed.' }
+
+    $installedManifest = Get-Content -LiteralPath `
+        (Join-Path $runnerRoot 'node_modules\@deepseek-ai\dsh\package.json') -Raw | ConvertFrom-Json
+    if ($installedManifest.version -ne $DshVersion) {
+        throw "Official DSH runner version mismatch: $($installedManifest.version)."
+    }
+    $script:runner = Get-Command (Join-Path $runnerRoot 'node_modules\.bin\dsh.cmd') `
+        -CommandType Application -ErrorAction Stop
+    $script:runnerPrefix = @()
+    & node (Join-Path $PSScriptRoot 'test-official-runtime.mjs') $runnerRoot
+    if ($LASTEXITCODE -ne 0) { throw 'Subscription behavior failed against official DSH dependencies.' }
+}
 
 function Invoke-Dsh {
     param([Parameter(Mandatory = $true)][string[]] $Arguments)
 
-    & $runner.Source @runnerPrefix @Arguments
+    Write-Host "Official DSH: $($Arguments -join ' ')"
+    & node (Join-Path $PSScriptRoot 'run-official-cli.mjs') $runner.Source @runnerPrefix @Arguments
     if ($LASTEXITCODE -ne 0) {
         throw "Official DSH command failed with exit code $LASTEXITCODE."
     }
@@ -79,13 +118,17 @@ function Start-And-ProbeWeb {
     try {
         $deadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)
         $response = $null
+        $webSession = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
         while ([DateTime]::UtcNow -lt $deadline) {
             if ($process.HasExited) {
                 $details = "$(Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue)`n$(Get-Content -LiteralPath $stderr -Raw -ErrorAction SilentlyContinue)"
                 throw "DSH web exited before readiness. $details"
             }
             try {
-                $response = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$port/" -TimeoutSec 2
+                $startupLog = Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue
+                $loggedUrl = [regex]::Match([string] $startupLog, 'dsh web:\s+(http://127\.0\.0\.1:' + $port + '/(?:\?token=[A-Za-z0-9_-]+)?)')
+                $readinessUrl = if ($loggedUrl.Success) { $loggedUrl.Groups[1].Value } else { "http://127.0.0.1:$port/" }
+                $response = Invoke-WebRequest -UseBasicParsing $readinessUrl -WebSession $webSession -TimeoutSec 2
                 if ($response.StatusCode -eq 200) { break }
             } catch {
                 Start-Sleep -Milliseconds 250
@@ -104,19 +147,20 @@ function Start-And-ProbeWeb {
 }
 
 try {
+    Initialize-Runner
     $latest = (& pnpm view dsh-codex-subscription dist-tags.latest --json 2>$null | Out-String).Trim().Trim('"')
     if ($LASTEXITCODE -eq 0 -and $latest -match '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
-        Invoke-Dsh @('plugin', '--profile', $Profile, 'add', "dsh-codex-subscription@$latest", '--loglevel', 'error')
+        Invoke-Dsh @('plugin', '--profile', $Profile, 'add', "dsh-codex-subscription@$latest", '--reporter', 'append-only')
     }
 
-    Invoke-Dsh @('plugin', '--profile', $Profile, 'add', $package, '--loglevel', 'error')
+    Invoke-Dsh @('plugin', '--profile', $Profile, 'add', $package, '--reporter', 'append-only')
     Assert-InstalledOnce
     Start-And-ProbeWeb
 
-    Invoke-Dsh @('plugin', '--profile', $Profile, 'remove', 'dsh-codex-subscription', '--loglevel', 'error')
+    Invoke-Dsh @('plugin', '--profile', $Profile, 'remove', 'dsh-codex-subscription', '--reporter', 'append-only')
     Assert-Removed
 
-    Invoke-Dsh @('plugin', '--profile', $Profile, 'add', $package, '--loglevel', 'error')
+    Invoke-Dsh @('plugin', '--profile', $Profile, 'add', $package, '--reporter', 'append-only')
     Assert-InstalledOnce
     Write-Host 'Official DSH end-to-end acceptance passed.'
 } finally {

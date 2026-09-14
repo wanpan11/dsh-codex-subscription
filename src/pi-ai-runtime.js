@@ -2,7 +2,18 @@
 // The exact peer version makes a DSH update fail visibly until this seam is
 // re-audited instead of silently changing authentication or cache semantics.
 import { openaiCodexProvider as createOpenAICodexProvider } from '@earendil-works/pi-ai/providers/openai-codex'
-import { SPEED_MODE_FAST, supportsCodexFastMode } from './settings-contract.js'
+import {
+  CONTEXT_MODE_CUSTOM,
+  CONTEXT_MODE_EXTENDED,
+  customContextModelKey,
+  OUTPUT_VERBOSITY_DEFAULT,
+  SPEED_MODE_FAST,
+  supportsCodexFastMode,
+  modelContextMaximum,
+  clampModelContext,
+} from './settings-contract.js'
+
+const FAST_SERVICE_TIER = 'priority'
 
 export { createModels } from '@earendil-works/pi-ai'
 export { createOpenAICodexProvider as openaiCodexProvider }
@@ -19,7 +30,16 @@ export { createOpenAICodexProvider as openaiCodexProvider }
  * persistence, headers, transport, and model behavior remain owned by the
  * original provider.
  */
-export function openaiCodexSubscriptionProvider({ resolveSpeedMode = () => undefined } = {}) {
+export function openaiCodexSubscriptionProvider({
+  resolveSpeedMode = () => undefined,
+  resolveOutputVerbosity = () => OUTPUT_VERBOSITY_DEFAULT,
+  resolveContextMode = () => undefined,
+  resolveCustomContextWindow = () => undefined,
+  catalog,
+  connection,
+  compaction,
+  runNetwork = (_area, operation) => operation(),
+} = {}) {
   const provider = createOpenAICodexProvider()
   const requestToken = Object.freeze({
     name: 'DSH-managed Codex OAuth request token',
@@ -29,25 +49,75 @@ export function openaiCodexSubscriptionProvider({ resolveSpeedMode = () => undef
       return { auth: { apiKey: token }, source: 'DSH-managed OAuth request' }
     },
   })
-  const withSpeed = (model, options = {}) => {
-    if (resolveSpeedMode() !== SPEED_MODE_FAST || !supportsCodexFastMode(model?.id)) return options
+  const modelMetadata = model => catalog?.metadata(model?.id)
+  const supportsVerbosity = model => modelMetadata(model)?.supportVerbosity ?? model?.id !== 'gpt-5.3-codex-spark'
+  const withPreferences = (model, options = {}) => {
+    const metadata = modelMetadata(model)
+    const requestedVerbosity = resolveOutputVerbosity()
+    const textVerbosity = supportsVerbosity(model)
+      ? requestedVerbosity === OUTPUT_VERBOSITY_DEFAULT
+        ? metadata?.defaultVerbosity ?? 'medium'
+        : requestedVerbosity
+      : undefined
+    const fast = resolveSpeedMode() === SPEED_MODE_FAST
+      && (metadata?.supportsFast ?? supportsCodexFastMode(model?.id))
     const onPayload = options.onPayload
     return {
       ...options,
-      serviceTier: 'fast',
+      ...(textVerbosity === undefined ? {} : { textVerbosity }),
+      ...(fast ? { serviceTier: FAST_SERVICE_TIER } : {}),
       async onPayload(payload, requestModel) {
-        const fastPayload = { ...payload, service_tier: 'fast' }
-        const next = await onPayload?.(fastPayload, requestModel)
-        return { ...(next ?? fastPayload), service_tier: 'fast' }
+        const preferred = {
+          ...payload,
+          ...(textVerbosity === undefined ? {} : { text: { ...(payload.text ?? {}), verbosity: textVerbosity } }),
+          ...(fast ? { service_tier: FAST_SERVICE_TIER } : {}),
+        }
+        const managed = compaction?.preparePayload(preferred) ?? preferred
+        const next = await onPayload?.(managed, requestModel)
+        return {
+          ...(next ?? managed),
+          ...(textVerbosity === undefined ? {} : { text: { ...((next ?? managed).text ?? {}), verbosity: textVerbosity } }),
+          ...(fast ? { service_tier: FAST_SERVICE_TIER } : {}),
+        }
       },
+    }
+  }
+  const getModels = () => (catalog?.getModels(provider.getModels()) ?? provider.getModels()).map(model => {
+    const maximum = modelContextMaximum(model)
+    const mode = resolveContextMode()
+    if (model.id === 'gpt-5.3-codex-spark' || ![CONTEXT_MODE_EXTENDED, CONTEXT_MODE_CUSTOM].includes(mode)) return model
+    if (mode === CONTEXT_MODE_EXTENDED) {
+      // Prefer the explicit catalog maximum; known offline models keep audited presets.
+      const contextWindow = maximum
+      return { ...model, contextWindow }
+    }
+    const requested = clampModelContext(resolveCustomContextWindow(customContextModelKey(model.id)), maximum, model.contextWindow)
+    return { ...model, contextWindow: requested }
+  })
+  const networkIterable = (factory, options) => {
+    let iterator
+    let prepared
+    const step = async (method, value) => {
+      const request = await (prepared ??= connection?.prepare(options) ?? Promise.resolve({ options }))
+      return runNetwork('model', () => {
+        iterator ??= factory(compaction?.requestOptions(request.options) ?? request.options)[Symbol.asyncIterator]()
+        return iterator[method]?.(value) ?? (method === 'throw' ? Promise.reject(value) : Promise.resolve({ done: true, value }))
+      }, compaction?.networkOptions(request.network) ?? request.network)
+    }
+    return {
+      [Symbol.asyncIterator]() { return this },
+      next: value => step('next', value),
+      return: value => iterator ? step('return', value) : Promise.resolve({ done: true, value }),
+      throw: error => iterator ? step('throw', error) : Promise.reject(error),
     }
   }
   return Object.freeze({
     ...provider,
     auth: Object.freeze({ ...provider.auth, apiKey: requestToken }),
-    stream: (model, context, options) => provider.stream(model, context, withSpeed(model, options)),
-    streamSimple: (model, context, options) => provider.streamSimple(model, context, withSpeed(model, options)),
+    getModels,
+    stream: (model, context, options) => networkIterable(prepared => provider.stream(model, context, prepared), withPreferences(model, options)),
+    streamSimple: (model, context, options) => networkIterable(prepared => provider.streamSimple(model, context, prepared), withPreferences(model, options)),
   })
 }
 
-export const PI_AI_RUNTIME_VERSION = '0.82.1'
+export const PI_AI_RUNTIME_VERSIONS = Object.freeze(['0.82.1', '0.85.1'])

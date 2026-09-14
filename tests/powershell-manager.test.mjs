@@ -9,7 +9,9 @@ import { createServer } from 'node:http'
 import test from 'node:test'
 
 const script = new URL('../dsh-codex.ps1', import.meta.url)
-const manifestVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
+const managerSource = readFileSync(script, 'utf8')
+const managedVersion = managerSource.match(/\$PackageVersion = '(\d+\.\d+\.\d+)'/u)?.[1]
+assert.match(managedVersion ?? '', /^\d+\.\d+\.\d+$/u)
 const windowsTest = process.platform === 'win32' ? test : test.skip
 const userPathTest = process.platform === 'win32' && process.env.DSH_CODEX_TEST_USER_PATH === '1'
   ? test
@@ -138,8 +140,12 @@ if (command === 'list') {
   if (process.env.DSH_CODEX_TEST_EMPTY_LIST === '1' && !fs.existsSync(stateFile)) process.exit(0)
   process.stdout.write(JSON.stringify([{ dependencies: packages }]))
 } else if (command === 'add') {
+  if (process.env.DSH_CODEX_TEST_RELEASE_AGE === '1' && !args.includes('--config.minimumReleaseAge=0')) {
+    process.stderr.write('ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION existing-plugin@1.0.0\n')
+    process.exit(1)
+  }
   if (process.env.DSH_CODEX_TEST_FAIL_ADD === '1') process.exit(9)
-  packages['dsh-codex-subscription'] = { version: process.env.DSH_CODEX_TEST_ADDED_VERSION || '${manifestVersion}' }
+  packages['dsh-codex-subscription'] = { version: process.env.DSH_CODEX_TEST_ADDED_VERSION || '${managedVersion}' }
   fs.writeFileSync(stateFile, JSON.stringify(packages))
 } else if (command === 'remove') {
   delete packages[args[4]]
@@ -149,9 +155,9 @@ if (command === 'list') {
 }
 `
   writeFileSync(join(root, 'app', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'), dsh)
-  const pnpm = join(root, 'data', 'runtime', 'dsh-codex-tools', 'pnpm-11.19.0', 'package', 'bin')
+  const pnpm = join(root, 'data', 'runtime', 'dsh-codex-tools', 'pnpm-11.26.0', 'package', 'bin')
   mkdirSync(pnpm, { recursive: true })
-  writeFileSync(join(pnpm, 'pnpm.cjs'), "console.log('11.19.0')\n")
+  writeFileSync(join(pnpm, 'pnpm.cjs'), "console.log('11.26.0')\n")
 }
 
 windowsTest('legacy manager can install into a completely new profile with an empty list response', () => {
@@ -171,9 +177,35 @@ windowsTest('legacy manager can install into a completely new profile with an em
     })
     assert.equal(result.status, 0, result.stderr || result.stdout)
     const installed = JSON.parse(readFileSync(join(root, 'data', 'dsh-home', 'fake-packages.json'), 'utf8'))
-    assert.equal(installed['dsh-codex-subscription'].version, manifestVersion)
+    assert.equal(installed['dsh-codex-subscription'].version, managedVersion)
   } finally {
-    rmSync(sandbox, { recursive: true, force: true })
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
+windowsTest('managed install retries one release-age-blocked mutation without disabling policy globally', () => {
+  const sandbox = mkdtempSync(join(tmpdir(), 'dsh-codex-managed-release-age-'))
+  const root = join(sandbox, 'DSH Portable')
+  const commandRoot = join(sandbox, 'command')
+  try {
+    functionalPortableFixture(root)
+    const result = spawnSync('powershell.exe', [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', script.pathname.replace(/^\/(?:([A-Za-z]:))/, '$1'),
+      '-Action', 'Install', '-PortableRoot', root,
+      '-CommandRoot', commandRoot, '-NoModifyPath',
+    ], {
+      encoding: 'utf8',
+      env: { ...process.env, DSH_CODEX_TEST_RELEASE_AGE: '1' },
+    })
+    assert.equal(result.status, 0, result.stderr || result.stdout)
+    const calls = JSON.parse(readFileSync(join(root, 'data', 'dsh-home', 'fake-calls.json'), 'utf8'))
+    const adds = calls.filter(args => args[0] === 'plugin' && args[3] === 'add')
+    assert.equal(adds.length, 2)
+    assert.equal(adds[0].includes('--config.minimumReleaseAge=0'), false)
+    assert.equal(adds[1].includes('--config.minimumReleaseAge=0'), true)
+  } finally {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
   }
 })
 
@@ -223,7 +255,7 @@ windowsTest('a failed update preserves the currently installed plugin', () => {
       'another-plugin': { version: '1.0.0' },
     })
   } finally {
-    rmSync(sandbox, { recursive: true, force: true })
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
   }
 })
 
@@ -243,7 +275,7 @@ windowsTest('update fails instead of reporting success when DSH keeps an older p
       env: { ...process.env, DSH_CODEX_TEST_ADDED_VERSION: '0.2.8' },
     })
     assert.notEqual(result.status, 0)
-    assert.match(result.stderr, new RegExp(`expected ${manifestVersion.replaceAll('.', '\\.')}[^]*found 0\\.2\\.8`, 'iu'))
+    assert.match(result.stderr, new RegExp(`expected ${managedVersion.replaceAll('.', '\\.')}[^]*found 0\\.2\\.8`, 'iu'))
     assert.doesNotMatch(result.stdout, /Updated\./u)
   } finally {
     rmSync(sandbox, { recursive: true, force: true })
@@ -548,7 +580,7 @@ windowsTest('direct uninstall removes only manager-owned files from a custom com
     assert.equal(existsSync(join(commandRoot, 'dsh-codex.ps1')), false)
     assert.equal(existsSync(join(commandRoot, 'dsh-codex.cmd')), false)
   } finally {
-    rmSync(sandbox, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 250 })
   }
 })
 
@@ -701,13 +733,13 @@ windowsTest('portable install uses the bundled CLI, DSH_HOME, and package store'
     assert.equal(plan.action, 'Install')
     assert.equal(plan.executable, join(expectedRoot, 'runtime', 'node', 'node.exe'))
     assert.equal(plan.dshHome, join(expectedRoot, 'data', 'dsh-home'))
-    assert.equal(plan.pnpmVersion, '11.19.0')
-    assert.equal(plan.pnpmDirectory, join(expectedRoot, 'data', 'runtime', 'dsh-codex-tools', 'pnpm-11.19.0'))
+    assert.equal(plan.pnpmVersion, '11.26.0')
+    assert.equal(plan.pnpmDirectory, join(expectedRoot, 'data', 'runtime', 'dsh-codex-tools', 'pnpm-11.26.0'))
     assert.equal(plan.pnpmStore, join(expectedRoot, 'data', 'pnpm-store'))
     assert.deepEqual(plan.arguments, [
       join(expectedRoot, 'app', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
       'plugin', '--profile', 'web', 'add',
-      `dsh-codex-subscription@${manifestVersion}`,
+      `dsh-codex-subscription@${managedVersion}`,
       '--store-dir', join(expectedRoot, 'data', 'pnpm-store'),
       '--loglevel', 'error',
     ])
@@ -728,7 +760,7 @@ windowsTest('portable install prefers the DSH-Portable command shim when availab
     assert.equal(plan.pnpmDirectory, null)
     assert.deepEqual(plan.arguments, [
       'plugin', '--profile', 'web', 'add',
-      `dsh-codex-subscription@${manifestVersion}`,
+      `dsh-codex-subscription@${managedVersion}`,
       '--store-dir', join(expectedRoot, 'data', 'pnpm-store'),
       '--loglevel', 'error',
     ])
@@ -748,7 +780,7 @@ windowsTest('installed portable mode expands its external state root', () => {
     assert.equal(plan.action, 'Update')
     assert.equal(plan.dshHome, join(realpathSync.native(localAppData), 'DeepSeek-Herness', 'data', 'dsh-home'))
     assert.equal(plan.pnpmStore, join(realpathSync.native(localAppData), 'DeepSeek-Herness', 'data', 'pnpm-store'))
-    assert.equal(plan.arguments.includes(`dsh-codex-subscription@${manifestVersion}`), true)
+    assert.equal(plan.arguments.includes(`dsh-codex-subscription@${managedVersion}`), true)
     assert.equal(plan.packageName, 'dsh-codex-subscription')
     assert.equal(plan.legacyPackageName, '@wsl043/dsh-codex-subscription')
   } finally {
@@ -814,7 +846,7 @@ windowsTest('auto-discovery still supports an existing global dsh command', () =
     assert.equal(plan.mode, 'global')
     assert.equal(plan.executable.toLowerCase(), join(bin, 'dsh.cmd').toLowerCase())
     assert.equal(plan.dshHome, null)
-    assert.equal(plan.pnpmDirectory, join(localAppData, 'dsh-codex-subscription', 'tools', 'pnpm-11.19.0'))
+    assert.equal(plan.pnpmDirectory, join(localAppData, 'dsh-codex-subscription', 'tools', 'pnpm-11.26.0'))
   } finally {
     rmSync(sandbox, { recursive: true, force: true })
   }

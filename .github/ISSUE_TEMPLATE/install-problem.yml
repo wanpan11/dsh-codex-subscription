@@ -1,83 +1,117 @@
-name: 安装或更新失败 / Install problem
-description: 安装、更新、登录、额度或卸载没有正常工作
-title: "[安装问题] "
+name: Bug report
+description: Report a reproducible installation, sign-in, model, quota, image, update, or uninstall problem
 labels:
   - bug
 body:
   - type: markdown
     attributes:
       value: |
-        请勿提交 Token、Cookie、OAuth 链接或其他凭据。
-        Do not include tokens, cookies, OAuth URLs, or other credentials.
+        Do not include tokens, cookies, OAuth URLs, authorization codes, or other credentials.
+        If Settings opens, generate a Support diagnostics report first; it excludes credentials and account identifiers.
 
   - type: dropdown
     id: system
     attributes:
-      label: 系统 / System
+      label: System
       options:
         - Windows
         - macOS
         - Linux
-        - 其他 / Other
+        - Other
     validations:
       required: true
 
   - type: dropdown
     id: dsh_mode
     attributes:
-      label: DSH 运行方式 / DSH setup
+      label: DSH setup
       options:
+        - Official DSH installation
         - DSH-Portable
         - npm / npx
-        - 源码运行 / From source
-        - 不确定 / Not sure
+        - From source
+        - Not sure
     validations:
       required: true
 
   - type: input
     id: plugin_version
     attributes:
-      label: 插件版本 / Plugin version
-      placeholder: 例如 v0.2.8 / e.g. v0.2.8
+      label: Plugin version
+      description: Copy the exact version from Settings or the plugin list. Enter "not installed" if setup did not finish.
+    validations:
+      required: true
+
+  - type: input
+    id: dsh_version
+    attributes:
+      label: DSH version
+      description: Copy the exact version from About, startup output, or the package manager.
     validations:
       required: true
 
   - type: dropdown
     id: stage
     attributes:
-      label: 出问题的步骤 / Failing step
+      label: Failing area
       options:
-        - 安装 / Install
-        - 更新 / Update
-        - 登录 / Sign in
-        - 模型或搜索 / Models or search
-        - 额度显示 / Quota display
-        - 卸载 / Uninstall
-        - 其他 / Other
+        - Install or update
+        - Browser sign-in or cancel
+        - Models, effort, or Fast mode
+        - Search
+        - Quota display or reset
+        - Image generation or editing
+        - Image preview or download
+        - Support diagnostics
+        - Uninstall
+        - Other
     validations:
       required: true
 
   - type: textarea
-    id: problem
+    id: steps
     attributes:
-      label: 发生了什么 / What happened
-      description: 写清操作步骤、预期结果和实际结果。
+      label: Steps to reproduce
+      description: List the smallest sequence that reproduces the problem.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Support diagnostics
+      description: Paste the report generated in Settings, or write "unavailable" and explain why. Do not paste full raw logs, secrets, or authorization links.
+      render: text
     validations:
       required: true
 
   - type: textarea
     id: output
     attributes:
-      label: 错误输出 / Error output
-      description: 粘贴完整错误；先移除 Token、Cookie、OAuth 链接和其他凭据。
+      label: Other error output
+      description: Paste any additional setup, terminal, or DSH error after removing credentials and authorization links.
       render: shell
-    validations:
-      required: true
 
   - type: checkboxes
     id: safety
     attributes:
-      label: 提交前确认 / Before submitting
+      label: Before submitting
       options:
-        - label: 我已确认内容中没有 Token、Cookie、OAuth 链接或其他凭据。
+        - label: I checked that this report contains no tokens, cookies, OAuth URLs, authorization codes, or other credentials.
+          required: true
+        - label: I provided the exact DSH and plugin versions, or stated that the plugin is not installed.
           required: true

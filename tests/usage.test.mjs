@@ -3,6 +3,12 @@ import test from 'node:test'
 
 import { createCodexUsageReader, parseCodexUsage } from '../src/usage.js'
 
+test('usage parser retains disclosed fractional percentage precision', () => {
+  const parsed = parseCodexUsage({ rate_limit: { primary_window: { used_percent: 12.3456, limit_window_seconds: 18000 } } })
+  assert.equal(parsed.rateLimits[0].windows[0].usedPercent, 12.3456)
+  assert.ok(Math.abs(parsed.rateLimits[0].windows[0].remainingPercent - 87.6544) < 1e-10)
+})
+
 test('usage parser returns secret-free remaining quota windows and exact disclosed balances', () => {
   const parsed = parseCodexUsage({
     rate_limit: {
@@ -42,7 +48,13 @@ test('usage parser returns secret-free remaining quota windows and exact disclos
         reset_at: 1_802_592_000,
       },
     },
-    rate_limit_reset_credits: { available_count: 2 },
+    rate_limit_reset_credits: {
+      available_count: 2,
+      credits: [
+        { id: 'later-secret', status: 'available', expires_at: 1_800_007_200 },
+        { id: 'earlier-secret', status: 'available', expires_at: 1_800_003_600 },
+      ],
+    },
     access_token: 'must-not-leak',
   })
   assert.deepEqual(parsed.rateLimits[0].windows, [
@@ -68,7 +80,11 @@ test('usage parser returns secret-free remaining quota windows and exact disclos
     resetsAt: 1_802_592_000,
   })
   assert.equal(parsed.spendControlReached, false)
-  assert.deepEqual(parsed.resetCredits, { availableCount: 2 })
+  assert.deepEqual(parsed.resetCredits, {
+    availableCount: 2,
+    credits: [{ expiresAt: 1_800_007_200_000 }, { expiresAt: 1_800_003_600_000 }],
+    nextExpiresAt: 1_800_003_600_000,
+  })
   assert.doesNotMatch(JSON.stringify(parsed), /must-not-leak|access_token/)
 })
 
@@ -229,6 +245,66 @@ test('clearing usage invalidates an older in-flight account request', async () =
   assert.equal((await fresh).rateLimits[0].windows[0].remainingPercent, 50)
   assert.equal((await stale).rateLimits[0].windows[0].remainingPercent, 90)
   assert.equal((await reader.read()).rateLimits[0].windows[0].remainingPercent, 50)
+  assert.equal(requests, 2)
+})
+
+test('usage reader cools down repeated failures and honors bounded retry-after on 429', async () => {
+  let now = 1_000
+  let requests = 0
+  const reader = createCodexUsageReader({
+    now: () => now,
+    failureTtlMs: 5_000,
+    maxRetryAfterMs: 60_000,
+    async getAuth() { return { auth: { apiKey: 'account-token' } } },
+    async readCredential() { return { type: 'oauth', accountId: 'account-id' } },
+    async fetch() {
+      requests += 1
+      if (requests === 1) {
+        return {
+          ok: false,
+          status: 429,
+          headers: new Headers({ 'retry-after': '120' }),
+        }
+      }
+      return {
+        ok: true,
+        async json() {
+          return { rate_limit: { primary_window: { used_percent: 50, limit_window_seconds: 604_800 } } }
+        },
+      }
+    },
+  })
+
+  await assert.rejects(reader.read(), /HTTP 429/u)
+  await assert.rejects(reader.read({ force: true }), /HTTP 429/u)
+  assert.equal(requests, 1, 'manual refresh must not hammer an active provider cooldown')
+
+  now += 59_999
+  await assert.rejects(reader.read(), /HTTP 429/u)
+  assert.equal(requests, 1)
+
+  now += 1
+  assert.equal((await reader.read()).rateLimits[0].windows[0].remainingPercent, 50)
+  assert.equal(requests, 2)
+})
+
+test('usage reader briefly negative-caches transport failures and clear removes the cooldown', async () => {
+  let requests = 0
+  const reader = createCodexUsageReader({
+    failureTtlMs: 5_000,
+    async getAuth() { return { auth: { apiKey: 'account-token' } } },
+    async readCredential() { return { type: 'oauth', accountId: 'account-id' } },
+    async fetch() {
+      requests += 1
+      throw new Error('private proxy address')
+    },
+  })
+
+  await assert.rejects(reader.read(), /private proxy address/u)
+  await assert.rejects(reader.read({ force: true }), /private proxy address/u)
+  assert.equal(requests, 1)
+  reader.clear()
+  await assert.rejects(reader.read(), /private proxy address/u)
   assert.equal(requests, 2)
 })
 

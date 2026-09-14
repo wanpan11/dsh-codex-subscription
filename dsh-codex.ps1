@@ -36,11 +36,11 @@ $ManagerScriptName = 'dsh-codex-manager.ps1'
 $LegacyManagerScriptName = 'dsh-codex.ps1'
 $ManagerShimName = 'dsh-codex.cmd'
 $ManagerStateName = 'install-state.json'
-$PackageVersion = '1.2.0'
-$PackageSpec = 'dsh-codex-subscription@1.2.0'
-$PnpmVersion = '11.19.0'
-$PnpmUrl = 'https://registry.npmjs.org/pnpm/-/pnpm-11.19.0.tgz'
-$PnpmSha512 = '7881F3ED590D472C4A955E2B88B2121791116066DCC88CBCA3849EC9B60F1BBAA6D2CCB221FA91DA4E1C65BEF2BCBE379365AEA7AC539C7BF86DEDC3A1B22DCE'
+$PackageVersion = '1.15.0'
+$PackageSpec = 'dsh-codex-subscription@1.15.0'
+$PnpmVersion = '11.26.0'
+$PnpmUrl = 'https://registry.npmjs.org/pnpm/-/pnpm-11.26.0.tgz'
+$PnpmSha512 = 'FC0E2BF890B9F983611F1AB68C0637BCE914390653699F83C1A78B005ED25F2C81E77920C8FD8EEE2ECF0B58B28CDCB00A84D97F69BCF7C56B2F344710238664'
 $ReleaseApi = if ($env:DSH_CODEX_RELEASE_API) { $env:DSH_CODEX_RELEASE_API } else { 'https://api.github.com/repos/WSL043/dsh-codex-subscription/releases/latest' }
 $ReleaseBase = if ($env:DSH_CODEX_RELEASE_BASE) { $env:DSH_CODEX_RELEASE_BASE.TrimEnd('/') } else { 'https://github.com/WSL043/dsh-codex-subscription/releases/download' }
 
@@ -708,8 +708,42 @@ function Invoke-DshCommand {
         if ($exitCode -ne 0) { throw "dsh failed with exit code $exitCode.`n$($output -join [Environment]::NewLine)" }
         return ($output -join [Environment]::NewLine)
     }
-    & $Target.Executable @allArguments
-    if ($LASTEXITCODE -ne 0) { throw "dsh failed with exit code $LASTEXITCODE." }
+    $output = [Collections.Generic.List[string]]::new()
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Target.Executable @allArguments 2>&1 | ForEach-Object {
+            $line = [string]$_
+            $output.Add($line)
+            Write-Host $line
+        }
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    $operationIndex = -1
+    for ($index = 0; $index -lt $Arguments.Count; $index += 1) {
+        if ($Arguments[$index] -in @('add', 'remove')) { $operationIndex = $index; break }
+    }
+    $releaseAgeBlocked = ($output -join "`n") -match 'ERR_PNPM_(?:MINIMUM_RELEASE_AGE_VIOLATION|NO_MATURE_MATCHING_VERSION)'
+    if ($exitCode -ne 0 -and $operationIndex -ge 0 -and $releaseAgeBlocked -and '--config.minimumReleaseAge=0' -notin $Arguments) {
+        Write-Host 'The existing lockfile contains a version still inside the release-age hold; retrying this command once with a scoped confirmation...'
+        $retryArguments = @($Arguments[0..$operationIndex]) + @('--config.minimumReleaseAge=0') + @($Arguments[($operationIndex + 1)..($Arguments.Count - 1)])
+        $retryAllArguments = if ($Target.Mode -eq 'portable' -and -not $Target.UsesPortableCli) {
+            @($Target.Layout.Dsh) + $retryArguments
+        } else {
+            $retryArguments
+        }
+        $previousErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $Target.Executable @retryAllArguments 2>&1 | ForEach-Object { Write-Host ([string]$_) }
+            $exitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousErrorAction
+        }
+    }
+    if ($exitCode -ne 0) { throw "dsh failed with exit code $exitCode." }
 }
 
 function Get-InstalledPackages {

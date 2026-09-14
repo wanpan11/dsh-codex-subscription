@@ -10,6 +10,29 @@ const badRequest = message => ({
   ok: false,
   error: { code: 'bad-request', message, details: { issues: [] } },
 })
+const accountStatusError = message => ({
+  ok: false,
+  error: { code: 'internal', message, details: { issues: [] } },
+})
+
+const classifyAccountStatusError = error => {
+  const message = error instanceof Error ? error.message : ''
+  if (/malformed (?:OAuth|grant|account vault)|received a malformed OAuth|contains malformed OAuth/iu.test(message)) {
+    return ['credential-malformed', 'Codex account credentials are malformed']
+  }
+  if (/credential|account vault|readRecord|credential store|credentials service/iu.test(message)) {
+    return ['credential-unavailable', 'Codex account credentials are unavailable']
+  }
+  const code = typeof error?.code === 'string' ? error.code.toUpperCase() : ''
+  if (error?.name === 'TimeoutError' || ['TIMEOUT', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT'].includes(code)) {
+    return ['transport', 'Codex account status service is unavailable']
+  }
+  if (['ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'NETWORK', 'NETWORK_ERROR', 'TRANSPORT'].includes(code)
+    || error?.name === 'NetworkError') {
+    return ['transport', 'Codex account status service is unavailable']
+  }
+  return ['unknown', 'Could not read Codex account status']
+}
 
 const deferred = () => {
   let resolve
@@ -27,6 +50,16 @@ const publicPrompt = prompt => ({
   ...(typeof prompt.placeholder === 'string' ? { placeholder: prompt.placeholder } : {}),
 })
 
+function classifyLoginFailure(error) {
+  const message = error instanceof Error ? error.message : ''
+  if (/token exchange failed/iu.test(message)) return 'token-exchange'
+  if (/fetch failed|\b(?:ECONN|ENOTFOUND|ETIMEDOUT|CERT_|socket|network)\b/iu.test(message)) return 'network'
+  if (/extract accountId|account[_ -]?id/iu.test(message)) return 'account-claim'
+  if (/credential|credentials-local|OAuth JSON/iu.test(message)) return 'credential-store'
+  if (/Missing authorization code|State mismatch|callback/iu.test(message)) return 'callback'
+  return 'provider'
+}
+
 /** Own one host-side login without exposing tokens to the browser client. */
 export class CodexLoginCoordinator {
   #sessions = new Map()
@@ -41,11 +74,31 @@ export class CodexLoginCoordinator {
     return publicClone(await this.auth.status(options))
   }
 
-  async start({ method }) {
+  supportState() {
+    const active = this.#activeId === undefined ? undefined : this.#sessions.get(this.#activeId)
+    if (active === undefined) return { phase: 'idle' }
+    return {
+      method: active.view.method,
+      phase: active.view.phase,
+      ...(active.view.phase === 'failed' ? { failure: classifyLoginFailure(active.hostError) } : {}),
+    }
+  }
+
+  async start({ method, label }) {
     if (!LOGIN_METHODS.has(method)) throw new Error(`unsupported Codex login method: ${String(method)}`)
+    if (label !== undefined && (typeof label !== 'string' || label.trim().length === 0 || label.trim().length > 48)) {
+      throw new Error('unsupported Codex account label')
+    }
     const active = this.#activeId === undefined ? undefined : this.#sessions.get(this.#activeId)
     if (active !== undefined && !TERMINAL_PHASES.has(active.view.phase)) {
-      throw new Error('a Codex login is already active')
+      active.view = {
+        id: active.view.id,
+        provider: 'openai-codex',
+        method: active.view.method,
+        phase: 'cancelled',
+        authenticated: false,
+      }
+      active.controller.abort(new Error('Codex login replaced by a new attempt'))
     }
     if (active !== undefined) this.#sessions.delete(active.view.id)
 
@@ -67,7 +120,7 @@ export class CodexLoginCoordinator {
     this.#sessions.set(id, session)
     this.#activeId = id
 
-    const publishReady = () => ready.resolve(this.read(id))
+    const publishReady = () => ready.resolve(publicClone(session.view))
     const interaction = {
       signal: controller.signal,
       prompt: async prompt => {
@@ -123,7 +176,7 @@ export class CodexLoginCoordinator {
     }
 
     session.run = Promise.resolve()
-      .then(() => this.auth.login(interaction))
+      .then(() => this.auth.login(interaction, label === undefined ? {} : { label: label.trim() }))
       .then(async () => {
         if (controller.signal.aborted) return
         const status = await this.auth.status()
@@ -136,7 +189,7 @@ export class CodexLoginCoordinator {
           ...(typeof status.expiresAt === 'number' ? { expiresAt: status.expiresAt } : {}),
         }
       })
-      .catch(error => {
+      .catch(async error => {
         if (controller.signal.aborted) {
           session.view = {
             id,
@@ -146,6 +199,23 @@ export class CodexLoginCoordinator {
             authenticated: false,
           }
           return
+        }
+        try {
+          if (label !== undefined) throw error
+          const status = await this.auth.status()
+          if (status.authenticated === true) {
+            session.view = {
+              id,
+              provider: 'openai-codex',
+              method,
+              phase: 'authenticated',
+              authenticated: true,
+              ...(typeof status.expiresAt === 'number' ? { expiresAt: status.expiresAt } : {}),
+            }
+            return
+          }
+        } catch {
+          // Preserve the provider failure when credential state cannot be read.
         }
         session.view = {
           id,
@@ -211,6 +281,14 @@ export class CodexLoginCoordinator {
     await this.auth.logout(options)
     return this.accountStatus(options)
   }
+
+  async selectAccount(id) {
+    return publicClone(await this.auth.select(id))
+  }
+
+  async removeAccount(id) {
+    return publicClone(await this.auth.remove(id))
+  }
 }
 
 /** Map the loopback-only DSH Connection channel onto the coordinator. */
@@ -220,9 +298,17 @@ export function createCodexRpcHandler(coordinator, options = {}) {
     try {
       signal.throwIfAborted()
       const input = asObject(payload)
-      if (endpoint === 'status') return ok(await coordinator.accountStatus({ signal }))
+      if (endpoint === 'status') {
+        try {
+          return ok(await coordinator.accountStatus({ signal }))
+        } catch (error) {
+          if (signal.aborted) throw error
+          const [, message] = classifyAccountStatusError(error)
+          return accountStatusError(message)
+        }
+      }
       if (endpoint === 'login/start') {
-        const started = await coordinator.start({ method: input.method })
+        const started = await coordinator.start({ method: input.method, label: input.label })
         if (input.openExternal !== true) return ok(started)
         const url = started.authUrl ?? started.deviceCode?.verificationUri
         if (typeof url !== 'string' || openExternal === undefined) {
@@ -239,6 +325,8 @@ export function createCodexRpcHandler(coordinator, options = {}) {
       if (endpoint === 'login/submit') return ok(await coordinator.submit({ id: input.id, value: input.value }))
       if (endpoint === 'login/cancel') return ok(await coordinator.cancel(input.id))
       if (endpoint === 'logout') return ok(await coordinator.logout({ signal }))
+      if (endpoint === 'account/select') return ok(await coordinator.selectAccount(input.id))
+      if (endpoint === 'account/remove') return ok(await coordinator.removeAccount(input.id))
       return badRequest(`unknown Codex auth endpoint: ${endpoint}`)
     } catch (error) {
       if (signal.aborted) throw error

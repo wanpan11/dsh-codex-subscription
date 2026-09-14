@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { createCodexAuthService, DshOAuthCredentialStore, readLocalCodexCredential } from '../src/credential-store.js'
+import { DshOAuthAccountVault } from '../src/account-vault.js'
 import { assertCodexAuthUrl, commandForCodexAuthUrl } from '../src/external-url.js'
 import { CodexLoginCoordinator, createCodexRpcHandler } from '../src/login-coordinator.js'
 import { readLoginProgress } from '../src/login-progress.js'
@@ -34,6 +35,24 @@ function keyedCredentials(initial = {}) {
     async set(ref, value) { values.set(ref, value) },
     async unset(ref) { values.delete(ref) },
     readRaw(ref) { return values.get(ref) },
+  }
+}
+
+function vaultCredentials({ refs = {}, records = {} } = {}) {
+  const refValues = new Map(Object.entries(refs))
+  const recordValues = new Map(Object.entries(records))
+  return {
+    async resolve(ref) { return refValues.has(ref) ? { value: refValues.get(ref) } : undefined },
+    async set(ref, value) { refValues.set(ref, value) },
+    async unset(ref) { refValues.delete(ref) },
+    async readRecord(key) { return structuredClone(recordValues.get(key)) },
+    async modifyRecord(key, mutate) {
+      const next = await mutate(structuredClone(recordValues.get(key)))
+      if (next !== undefined) recordValues.set(key, structuredClone(next))
+      return structuredClone(recordValues.get(key))
+    },
+    async deleteRecord(key) { recordValues.delete(key) },
+    readRef(ref) { return refValues.get(ref) },
   }
 }
 
@@ -73,6 +92,60 @@ test('local Codex auth can be imported without exposing token fields', async () 
     const store = new DshOAuthCredentialStore(backend, 'CODEX_OAUTH')
     assert.equal(await store.importLocal({ path }), true)
     assert.deepEqual(JSON.parse(backend.readRaw()), credential)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('local Codex auth import registers an active vault account on the multi-account layout', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-codex-'))
+  const path = join(directory, 'auth.json')
+  try {
+    await writeFile(path, JSON.stringify({ tokens: {
+      access_token: 'local-access', refresh_token: 'local-refresh', account_id: 'local-account',
+    } }))
+    const backend = vaultCredentials()
+    const vault = new DshOAuthAccountVault(backend, {
+      key: 'dsh-codex-subscription/accounts',
+      legacyRef: 'CODEX_OAUTH',
+    })
+    const store = new DshOAuthCredentialStore(backend, 'CODEX_OAUTH', [], { vault })
+    assert.equal(await store.importLocal({ path }), true)
+
+    const active = await store.read('openai-codex')
+    assert.equal(active.access, 'local-access')
+    assert.equal(active.refresh, 'local-refresh')
+    const accounts = await vault.list()
+    assert.equal(accounts.length, 1)
+    assert.equal(accounts[0].active, true)
+    assert.equal(accounts[0].label, 'Account 1')
+    assert.doesNotMatch(JSON.stringify(accounts), /local-access|local-refresh|local-account/)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('local Codex auth import is a no-op while a vault account is already active', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'dsh-codex-'))
+  const path = join(directory, 'auth.json')
+  try {
+    await writeFile(path, JSON.stringify({ tokens: {
+      access_token: 'local-access', refresh_token: 'local-refresh', account_id: 'local-account',
+    } }))
+    const backend = vaultCredentials()
+    const vault = new DshOAuthAccountVault(backend, {
+      key: 'dsh-codex-subscription/accounts',
+      legacyRef: 'CODEX_OAUTH',
+    })
+    const store = new DshOAuthCredentialStore(backend, 'CODEX_OAUTH', [], { vault })
+    await store.modify('openai-codex', async () => oauth('existing'))
+    // The vault is authoritative; drop the mirrored legacy credential so only the
+    // vault knows an account is active. A legacy-only check would wrongly re-import.
+    await backend.unset('CODEX_OAUTH')
+
+    assert.equal(await store.importLocal({ path }), false)
+    assert.equal((await store.read('openai-codex')).access, 'access-existing')
+    assert.doesNotMatch(JSON.stringify(await vault.list()), /local-access|local-refresh/)
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
@@ -173,6 +246,68 @@ test('login RPC exposes only public flow state and sanitizes host failures', asy
   const finished = await handler('login/status', { id: 'login-1' }, signal)
   assert.equal(finished.value.phase, 'failed')
   assert.doesNotMatch(JSON.stringify(finished), /access-secret|refresh-secret/)
+  assert.deepEqual(coordinator.supportState(), { method: 'browser', phase: 'failed', failure: 'provider' })
+})
+
+test('account status RPC uses the supported internal error shape with fixed safe messages', async () => {
+  const cases = [
+    [new Error('Codex account vault contains a malformed grant record with refresh-secret'), 'Codex account credentials are malformed'],
+    [new Error('credential service unavailable for account status'), 'Codex account credentials are unavailable'],
+    [Object.assign(new Error('socket closed at 127.0.0.1:7890'), { code: 'ECONNRESET' }), 'Codex account status service is unavailable'],
+    [new Error('provider response included access-secret'), 'Could not read Codex account status'],
+  ]
+  for (const [failure, message] of cases) {
+    const coordinator = new CodexLoginCoordinator({
+      async status() { throw failure },
+    })
+    const response = await createCodexRpcHandler(coordinator)('status', {}, new AbortController().signal)
+    assert.deepEqual(response, {
+      ok: false,
+      error: { code: 'internal', message, details: { issues: [] } },
+    })
+    assert.doesNotMatch(JSON.stringify(response), /secret|127\.0\.0\.1|7890/u)
+  }
+})
+
+test('support diagnostics expose only a bounded login phase', async () => {
+  const auth = {
+    async status() { return { authenticated: false, provider: 'openai-codex' } },
+    async login(interaction) {
+      interaction.notify({ type: 'auth_url', url: 'https://auth.openai.com/oauth/authorize?state=private' })
+      await new Promise(() => {})
+    },
+    async logout() {},
+  }
+  const coordinator = new CodexLoginCoordinator(auth, { createId: () => 'private-login-id' })
+  assert.deepEqual(coordinator.supportState(), { phase: 'idle' })
+  await coordinator.start({ method: 'browser' })
+  const state = coordinator.supportState()
+  assert.deepEqual(state, { method: 'browser', phase: 'waiting_browser' })
+  assert.doesNotMatch(JSON.stringify(state), /private|auth\.openai|login-id/u)
+})
+
+test('login RPC reports authentication when the browser stored credentials before its provider task failed', async () => {
+  let authenticated = false
+  const auth = {
+    async status() { return { authenticated, provider: 'openai-codex', type: authenticated ? 'oauth' : undefined } },
+    async login(interaction) {
+      interaction.notify({ type: 'auth_url', url: 'https://auth.openai.com/oauth/authorize?state=public' })
+      authenticated = true
+      throw new Error('provider callback closed after credentials were stored')
+    },
+    async logout() {},
+  }
+  const coordinator = new CodexLoginCoordinator(auth, { createId: () => 'login-macos' })
+  const handler = createCodexRpcHandler(coordinator, { openExternal: async () => {} })
+  const signal = new AbortController().signal
+
+  await handler('login/start', { method: 'browser', openExternal: true }, signal)
+  await new Promise(resolve => setTimeout(resolve, 0))
+
+  const finished = await handler('login/status', { id: 'login-macos' }, signal)
+  assert.equal(finished.value.phase, 'authenticated')
+  assert.equal(finished.value.authenticated, true)
+  assert.doesNotMatch(JSON.stringify(finished), /provider callback/)
 })
 
 test('login flow never returns an untrusted provider URL to the browser client', async () => {
@@ -206,6 +341,67 @@ test('starting a new login discards the previous terminal session', async () => 
   assert.throws(() => coordinator.read('login-1'), /unknown Codex login/)
 })
 
+test('starting a new login replaces an orphaned active flow after the client lost its id', async () => {
+  const ids = ['login-browser', 'login-device']
+  const aborted = []
+  const auth = {
+    async status() { return { authenticated: false, provider: 'openai-codex' } },
+    async login(interaction) {
+      interaction.signal.addEventListener('abort', () => aborted.push(true), { once: true })
+      interaction.notify({ type: 'auth_url', url: 'https://auth.openai.com/oauth/authorize?state=public' })
+      await new Promise((resolve, reject) => interaction.signal.addEventListener('abort', () => reject(interaction.signal.reason), { once: true }))
+    },
+    async logout() {},
+  }
+  const coordinator = new CodexLoginCoordinator(auth, { createId: () => ids.shift() })
+
+  const browser = await coordinator.start({ method: 'browser' })
+  const device = await coordinator.start({ method: 'device_code' })
+
+  assert.equal(browser.id, 'login-browser')
+  assert.equal(device.id, 'login-device')
+  assert.deepEqual(aborted, [true])
+  assert.throws(() => coordinator.read('login-browser'), /unknown Codex login/)
+  await new Promise(resolve => setImmediate(resolve))
+})
+
+test('support diagnostics classify post-callback failures without exposing provider details', async () => {
+  const auth = {
+    async status() { return { authenticated: false, provider: 'openai-codex' } },
+    async login(interaction) {
+      interaction.notify({ type: 'auth_url', url: 'https://auth.openai.com/oauth/authorize?state=private' })
+      throw new Error('OpenAI Codex token exchange failed (400): refresh-secret')
+    },
+    async logout() {},
+  }
+  const coordinator = new CodexLoginCoordinator(auth, { createId: () => 'login-failed' })
+  await coordinator.start({ method: 'browser' })
+  await new Promise(resolve => setTimeout(resolve, 0))
+
+  assert.deepEqual(coordinator.supportState(), {
+    method: 'browser',
+    phase: 'failed',
+    failure: 'token-exchange',
+  })
+  assert.doesNotMatch(JSON.stringify(coordinator.supportState()), /refresh-secret|400|private/u)
+})
+
+test('support diagnostics identify OAuth transport failures without exposing proxy details', async () => {
+  const coordinator = new CodexLoginCoordinator({
+    async login() { throw new Error('fetch failed: ECONNREFUSED 127.0.0.1:7890') },
+    async status() { return { authenticated: false, provider: 'openai-codex' } },
+  }, { createId: () => 'login-network' })
+
+  await coordinator.start({ method: 'browser' })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(coordinator.supportState(), {
+    method: 'browser',
+    phase: 'failed',
+    failure: 'network',
+  })
+  assert.doesNotMatch(JSON.stringify(coordinator.supportState()), /127\.0\.0\.1|7890/u)
+})
+
 test('login polling recovers an authenticated account after the flow RPC is lost', async () => {
   const account = { authenticated: true, provider: 'openai-codex', type: 'oauth' }
   const next = await readLoginProgress({
@@ -217,6 +413,26 @@ test('login polling recovers an authenticated account after the flow RPC is lost
   assert.deepEqual(next, {
     flow: {
       id: 'login-old',
+      method: 'browser',
+      phase: 'authenticated',
+      authenticated: true,
+    },
+    account,
+    recovered: true,
+  })
+})
+
+test('login polling trusts the credential store when browser auth succeeds after a failed flow terminal', async () => {
+  const account = { authenticated: true, provider: 'openai-codex', type: 'oauth' }
+  const next = await readLoginProgress({
+    flow: { id: 'login-macos', method: 'browser', phase: 'waiting_browser' },
+    async readFlow() { return { id: 'login-macos', method: 'browser', phase: 'failed' } },
+    async readAccount() { return account },
+  })
+
+  assert.deepEqual(next, {
+    flow: {
+      id: 'login-macos',
       method: 'browser',
       phase: 'authenticated',
       authenticated: true,
@@ -245,4 +461,28 @@ test('cancelling acknowledges immediately even when the provider login does not 
   ])
   assert.notEqual(result, 'timeout')
   assert.equal(result.phase, 'cancelled')
+})
+
+test('account RPC selects and removes only opaque local account ids', async () => {
+  const calls = []
+  const coordinator = new CodexLoginCoordinator({
+    async status() { return { authenticated: true, provider: 'openai-codex', accounts: [] } },
+    async select(id) { calls.push(['select', id]); return this.status() },
+    async remove(id) { calls.push(['remove', id]); return this.status() },
+  })
+  const handler = createCodexRpcHandler(coordinator)
+  const signal = new AbortController().signal
+  assert.equal((await handler('account/select', { id: 'local-a' }, signal)).ok, true)
+  assert.equal((await handler('account/remove', { id: 'local-b' }, signal)).ok, true)
+  assert.deepEqual(calls, [['select', 'local-a'], ['remove', 'local-b']])
+})
+
+test('failed add-account login cannot be mistaken for the already active account', async () => {
+  const coordinator = new CodexLoginCoordinator({
+    async login() { throw new Error('second account token exchange failed') },
+    async status() { return { authenticated: true, provider: 'openai-codex' } },
+  }, { createId: () => 'add-account' })
+  await coordinator.start({ method: 'browser', label: 'Work' })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(coordinator.read('add-account').phase, 'failed')
 })

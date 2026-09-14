@@ -39,36 +39,85 @@ export function compareVersions(left, right) {
 }
 
 export function selectNextUntestedVersion(versions, current) {
-  parseVersion(current)
+  const compatibility = typeof current === 'string'
+    ? { latestTested: current, supported: [current], previews: [] }
+    : current
+  parseVersion(compatibility.latestTested)
+  const tested = new Set([...(compatibility.supported ?? []), ...(compatibility.previews ?? [])])
+  const previewFloor = [...(compatibility.previews ?? [])].sort(compareVersions).at(-1)
+    ?? compatibility.latestTested
   return [...new Set(versions)]
-    .filter(version => typeof version === 'string' && compareVersions(version, current) > 0)
+    .filter(version => typeof version === 'string'
+      && !tested.has(version)
+      && compareVersions(version, isPreviewVersion(version) ? previewFloor : compatibility.latestTested) > 0)
     .sort(compareVersions)[0] ?? null
 }
 
-function bumpPatch(version) {
+function isPreviewVersion(version) {
+  const [channel] = parseVersion(version).prerelease
+  return channel === 'alpha' || channel === 'beta'
+}
+
+function nextStableVersion(version) {
   const parsed = parseVersion(version)
-  if (parsed.prerelease.length > 0) throw new Error(`automatic compatibility releases require a stable plugin version: ${version}`)
+  if (parsed.prerelease.length > 0) {
+    if (parsed.prerelease[0] !== 'beta') throw new Error(`unsupported plugin prerelease: ${version}`)
+    return parsed.core.join('.')
+  }
   return `${parsed.core[0]}.${parsed.core[1]}.${parsed.core[2] + 1}`
+}
+
+function nextBetaVersion(version) {
+  const parsed = parseVersion(version)
+  if (parsed.prerelease.length === 0) {
+    return `${parsed.core[0]}.${parsed.core[1]}.${parsed.core[2] + 1}-beta.0`
+  }
+  if (parsed.prerelease.length !== 2 || parsed.prerelease[0] !== 'beta'
+    || !Number.isInteger(parsed.prerelease[1])) {
+    throw new Error(`unsupported plugin prerelease: ${version}`)
+  }
+  return `${parsed.core.join('.')}-beta.${parsed.prerelease[1] + 1}`
+}
+
+function previousDocumentedPluginVersion(version) {
+  const parsed = parseVersion(version)
+  if (parsed.prerelease.length === 0) return version
+  if (parsed.prerelease.length !== 2 || parsed.prerelease[0] !== 'beta'
+    || !Number.isInteger(parsed.prerelease[1]) || parsed.core[2] === 0) {
+    throw new Error(`unsupported plugin prerelease: ${version}`)
+  }
+  return `${parsed.core[0]}.${parsed.core[1]}.${parsed.core[2] - 1}`
 }
 
 export function planCompatibilityUpdate(state, candidate) {
   parseVersion(candidate)
-  const previousDshVersion = state.compatibility.latestTested
+  const preview = isPreviewVersion(candidate)
+  const lane = preview ? (state.compatibility.previews ?? []) : state.compatibility.supported
+  const previousDshVersion = preview
+    ? [...lane].sort(compareVersions).at(-1) ?? state.compatibility.latestTested
+    : state.compatibility.latestTested
   const order = compareVersions(candidate, previousDshVersion)
   if (order === 0) return null
   if (order < 0) throw new Error(`DSH candidate ${candidate} is older than latest tested ${previousDshVersion}`)
 
   const compatibility = structuredClone(state.compatibility)
-  compatibility.latestTested = candidate
-  compatibility.supported = [...new Set([...compatibility.supported, candidate])].sort(compareVersions)
+  compatibility.previews ??= []
+  if (preview) {
+    compatibility.previews = [...new Set([...compatibility.previews, candidate])].sort(compareVersions)
+  } else {
+    compatibility.latestTested = candidate
+    compatibility.supported = [...new Set([...compatibility.supported, candidate])].sort(compareVersions)
+  }
 
   const manifest = structuredClone(state.manifest)
   const previousPluginVersion = manifest.version
-  manifest.version = bumpPatch(previousPluginVersion)
-  for (const name of Object.keys(manifest.devDependencies ?? {})) {
-    if (name.startsWith('@deepseek-ai/dsh-')) manifest.devDependencies[name] = candidate
+  manifest.version = preview ? nextBetaVersion(previousPluginVersion) : nextStableVersion(previousPluginVersion)
+  if (!preview) {
+    for (const name of Object.keys(manifest.devDependencies ?? {})) {
+      if (name.startsWith('@deepseek-ai/dsh-')) manifest.devDependencies[name] = candidate
+    }
   }
-  const supportedRange = compatibility.supported.join(' || ')
+  const supportedRange = [...compatibility.supported, ...compatibility.previews].sort(compareVersions).join(' || ')
   for (const name of Object.keys(manifest.peerDependencies ?? {})) {
     if (name.startsWith('@deepseek-ai/dsh-')) manifest.peerDependencies[name] = supportedRange
   }
@@ -77,18 +126,37 @@ export function planCompatibilityUpdate(state, candidate) {
     previousDshVersion,
     dshVersion: candidate,
     previousPluginVersion,
+    previousDocumentedPluginVersion: previousDocumentedPluginVersion(previousPluginVersion),
     pluginVersion: manifest.version,
+    updateStableReferences: !preview,
     compatibility,
     manifest,
   }
 }
 
 export function rewriteBoundedVersions(source, update, label) {
-  let rewritten = source
-    .replaceAll(update.previousPluginVersion, update.pluginVersion)
-    .replaceAll(update.previousDshVersion, update.dshVersion)
+  const previousVersion = update.previousDocumentedPluginVersion ?? update.previousPluginVersion
+  let rewritten = source.replaceAll(previousVersion, update.pluginVersion)
+  if (update.updateStableReferences) rewritten = rewritten.replaceAll(update.previousDshVersion, update.dshVersion)
   if (rewritten === source) throw new Error(`no bounded version reference changed in ${label}`)
-  if (rewritten.includes(update.previousPluginVersion)) throw new Error(`stale plugin version remains in ${label}`)
+  if (rewritten.includes(previousVersion)) throw new Error(`stale plugin version remains in ${label}`)
+  return rewritten
+}
+
+export function boundedArtifactPaths(update) {
+  if (!update.updateStableReferences) return []
+  return [
+    'README.md',
+    'README.en.md',
+    'dsh-codex.ps1',
+    '.github/scripts/accept-official-release.ps1',
+  ]
+}
+
+export function rewriteWorkspaceCohort(workspace, update) {
+  if (!update.updateStableReferences) return workspace
+  const rewritten = workspace.replaceAll(update.previousDshVersion, update.dshVersion)
+  if (rewritten === workspace) throw new Error(`DSH release cohort ${update.previousDshVersion} was not found`)
   return rewritten
 }
 
@@ -127,23 +195,13 @@ async function prepare(root, candidate) {
   const update = planCompatibilityUpdate({ compatibility, manifest }, candidate)
   if (update === null) return { changed: false, dshVersion: candidate, pluginVersion: manifest.version }
 
-  const boundedPaths = [
-    'README.md',
-    'README.en.md',
-    'AGENTS.md',
-    'dsh-codex.ps1',
-    'dsh-codex-setup.ps1',
-    '.github/scripts/accept-official-release.ps1',
-    '.github/workflows/publish.yml',
-  ]
+  const boundedPaths = boundedArtifactPaths(update)
   const sources = await Promise.all(boundedPaths.map(path => readFile(resolve(root, path), 'utf8')))
   const rewritten = sources.map((source, index) => rewriteBoundedVersions(source, update, boundedPaths[index]))
 
   const workspacePath = resolve(root, 'pnpm-workspace.yaml')
   const workspace = await readFile(workspacePath, 'utf8')
-  const nextWorkspace = workspace
-    .replaceAll(update.previousDshVersion, update.dshVersion)
-  if (nextWorkspace === workspace) throw new Error(`DSH release cohort ${update.previousDshVersion} was not found`)
+  const nextWorkspace = rewriteWorkspaceCohort(workspace, update)
 
   await Promise.all([
     writeFile(compatibilityPath, `${JSON.stringify(update.compatibility, null, 2)}\n`),

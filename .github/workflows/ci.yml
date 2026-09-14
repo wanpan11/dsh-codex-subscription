@@ -1,4 +1,4 @@
-name: CI
+name: Risk-based CI
 
 on:
   push:
@@ -13,81 +13,122 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
+  plan:
+    name: Classify changed risk
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      behavior: ${{ steps.plan.outputs.behavior }}
+      delivery: ${{ steps.plan.outputs.delivery }}
+      manager: ${{ steps.plan.outputs.manager }}
+      official: ${{ steps.plan.outputs.official }}
+      runtime: ${{ steps.plan.outputs.runtime }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Refuse unpublished runtime drift and select meaningful gates
+        id: plan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          published="$(npm view dsh-codex-subscription dist-tags.latest)"
+          node scripts/ci-change-plan.mjs --base "$BASE_SHA" --published "$published"
+
+  behavior:
+    name: Runtime behavior and candidate package
+    needs: plan
+    if: needs.plan.outputs.behavior == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v5
         with:
-          version: 11.19.0
+          version: 11.26.0
           run_install: false
       - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - run: pnpm test
+      - name: Run user-path behavior scenarios
+        run: pnpm run test:behavior
       - run: pnpm run build
-      - name: Verify committed build output
+      - name: Verify committed runtime output
         run: git diff --exit-code -- lib
-      - name: Pack release artifact
+      - name: Pack the exact candidate
         run: |
           pnpm pack --pack-destination .artifacts
-          cp dsh-codex.ps1 .artifacts/dsh-codex.ps1
-          cp dsh-codex-setup.ps1 .artifacts/dsh-codex-setup.ps1
-          (cd .artifacts && sha256sum dsh-codex.ps1 > dsh-codex.ps1.sha256)
           artifact="$(find .artifacts -maxdepth 1 -type f -name '*.tgz' -print -quit)"
           test -n "$artifact"
           test -s "$artifact"
-          test -s .artifacts/dsh-codex.ps1
-          test -s .artifacts/dsh-codex.ps1.sha256
-          test -s .artifacts/dsh-codex-setup.ps1
       - uses: actions/upload-artifact@v7
         with:
           name: dsh-codex-subscription-${{ github.sha }}
           path: |
             .artifacts/*.tgz
-            .artifacts/dsh-codex.ps1
-            .artifacts/dsh-codex.ps1.sha256
-            .artifacts/dsh-codex-setup.ps1
           if-no-files-found: error
           include-hidden-files: true
 
-  windows-powershell:
-    name: Windows PowerShell (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-2022, windows-2025]
-    runs-on: ${{ matrix.os }}
+  delivery:
+    name: Package and public-contract checks
+    needs: plan
+    if: needs.plan.outputs.delivery == 'true'
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v5
         with:
-          version: 11.19.0
+          version: 11.26.0
           run_install: false
       - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - name: Verify Windows installer lifecycle
-        run: node --test tests/powershell-manager.test.mjs tests/thin-installer.test.mjs
+      - run: pnpm run test:delivery
+
+  windows-manager:
+    name: Optional Windows manager risk
+    needs: plan
+    if: needs.plan.outputs.manager == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Exercise manager discovery, update, cancel, and failure paths
+        shell: powershell
+        run: node --test tests/powershell-manager.test.mjs
         env:
           DSH_CODEX_TEST_USER_PATH: '1'
 
   official-acceptance:
-    name: Official DSH end-to-end acceptance
-    needs: verify
+    name: Official DSH acceptance (${{ matrix.channel }})
+    needs: [plan, behavior]
+    if: needs.plan.outputs.official == 'true' && needs.behavior.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [latest, alpha]
     runs-on: windows-2025
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - uses: pnpm/action-setup@v5
         with:
-          version: 11.19.0
+          version: 11.26.0
           run_install: false
       - uses: actions/setup-node@v6
         with:
@@ -97,9 +138,14 @@ jobs:
         with:
           name: dsh-codex-subscription-${{ github.sha }}
           path: .candidate
-      - name: Official DSH end-to-end acceptance
+      - name: Install locked test fixtures
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Install, update, compose, start Web, remove, and reinstall
         shell: powershell
         run: |
           $package = (Get-ChildItem -LiteralPath .candidate -Filter '*.tgz' -File | Select-Object -First 1).FullName
           if (-not $package) { throw 'Candidate package artifact was not downloaded.' }
-          .\.github\scripts\accept-official-release.ps1 -PackagePath $package -DshRunner pnpm
+          $version = (& pnpm view '@deepseek-ai/dsh@${{ matrix.channel }}' version --json | Out-String).Trim().Trim('"')
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw 'Could not resolve the official DSH channel.' }
+          Write-Host "Accepting official DSH $version"
+          .\.github\scripts\accept-official-release.ps1 -PackagePath $package -DshRunner pnpm -DshVersion $version

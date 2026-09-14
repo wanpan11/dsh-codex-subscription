@@ -2,6 +2,9 @@ import { defineConfig } from 'tsdown'
 
 const id = 'dsh-codex-subscription'
 const hostExternal = [
+  '@deepseek-ai/dsh-subagent-codex',
+  '@deepseek-ai/dsh-sdk-protocol',
+  '@deepseek-ai/dsh-client-connection',
   '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-credentials',
   '@deepseek-ai/dsh-llm',
@@ -14,12 +17,17 @@ const hostExternal = [
   '@earendil-works/pi-ai/providers/openai-codex',
 ]
 const clientExternal = [
-  'react', 'react/jsx-runtime', '@deepseek-ai/cordis',
+  'react', 'react/jsx-runtime', 'react-dom', '@deepseek-ai/cordis',
   '@deepseek-ai/dsh-client-ui-primitives',
   '@deepseek-ai/dsh-client-ui-slots',
 ]
 
 export default defineConfig([
+  {
+    name:'sketch-psd-codec',entry:{'sketch-psd-worker':'src/sketch-psd-worker.js'},
+    outDir:'lib',format:'esm',platform:'browser',target:'es2022',clean:false,minify:true,
+    deps:{onlyBundle:['ag-psd','base64-js','pako']},
+  },
   {
     name: id,
     entry: { index: 'src/index.js' },

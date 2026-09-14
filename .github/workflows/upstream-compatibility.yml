@@ -2,13 +2,18 @@ name: DSH compatibility autopilot
 
 on:
   schedule:
-    - cron: '29 */6 * * *'
+    - cron: '29 */3 * * *'
   workflow_dispatch:
     inputs:
       dsh_version:
-        description: Exact official DSH version; empty selects the oldest untested version
+        description: Exact official DSH version; empty selects the newest untested version
         required: false
         type: string
+      publish_compatibility:
+        description: Publish an accepted compatibility update only when adaptation is required
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -32,7 +37,7 @@ jobs:
           ref: main
       - uses: pnpm/action-setup@v5
         with:
-          version: 11.19.0
+          version: 11.26.0
           run_install: false
       - uses: actions/setup-node@v6
         with:
@@ -55,12 +60,19 @@ jobs:
             mapfile -t candidates < <(node --input-type=module -e '
               import { readFileSync } from "node:fs";
               import { compareVersions } from "./scripts/prepare-compat-release.mjs";
-              const current = process.argv[2];
+              const compatibility = JSON.parse(readFileSync(process.argv[2], "utf8"));
+              const current = compatibility.latestTested;
+              const tested = new Set([...(compatibility.supported ?? []), ...(compatibility.previews ?? [])]);
+              const previewFloor = [...(compatibility.previews ?? [])].sort(compareVersions).at(-1) ?? current;
               const versions = [...new Set(JSON.parse(readFileSync(process.argv[1], "utf8")))]
-                .filter(version => typeof version === "string" && compareVersions(version, current) > 0)
-                .sort(compareVersions);
+                .filter(version => {
+                  const preview = /-(?:alpha|beta)(?:\.|$)/u.test(version);
+                  return typeof version === "string" && !tested.has(version)
+                    && compareVersions(version, preview ? previewFloor : current) > 0;
+                })
+                .sort(compareVersions).reverse();
               process.stdout.write(versions.join("\n"));
-            ' "$RUNNER_TEMP/dsh-versions.json" "$current")
+            ' "$RUNNER_TEMP/dsh-versions.json" compatibility.json)
             candidate=''
             for version in "${candidates[@]}"; do
               if test "$(pnpm view "@deepseek-ai/dsh@$version" version 2>/dev/null || true)" = "$version" &&
@@ -103,7 +115,7 @@ jobs:
         run: |
           pnpm test
           pnpm run build
-          git diff --exit-code --check
+          git diff --check
           rm -rf .candidate
           mkdir .candidate
           pnpm pack --pack-destination .candidate
@@ -128,7 +140,7 @@ jobs:
           ref: main
       - uses: pnpm/action-setup@v5
         with:
-          version: 11.19.0
+          version: 11.26.0
           run_install: false
       - uses: actions/setup-node@v6
         with:
@@ -148,7 +160,7 @@ jobs:
         shell: powershell
         env:
           DSH_CODEX_TEST_USER_PATH: '1'
-        run: node --test tests/powershell-manager.test.mjs tests/thin-installer.test.mjs
+        run: node --test tests/powershell-manager.test.mjs
       - name: Accept install, update, Web startup, and uninstall in official DSH
         shell: powershell
         run: |
@@ -162,7 +174,7 @@ jobs:
 
   promote:
     needs: [prepare, windows-acceptance]
-    if: needs.prepare.outputs.changed == 'true' && needs.windows-acceptance.result == 'success'
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_compatibility == true && needs.prepare.outputs.changed == 'true' && needs.windows-acceptance.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -175,7 +187,7 @@ jobs:
           fetch-depth: 0
       - uses: pnpm/action-setup@v5
         with:
-          version: 11.19.0
+          version: 11.26.0
           run_install: false
       - uses: actions/setup-node@v6
         with:
@@ -218,7 +230,7 @@ jobs:
           set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add -- .github/scripts/accept-official-release.ps1 .github/workflows/publish.yml AGENTS.md README.md README.en.md compatibility.json dsh-codex-setup.ps1 dsh-codex.ps1 lib package.json pnpm-lock.yaml pnpm-workspace.yaml
+          git add -- .github/scripts/accept-official-release.ps1 README.md README.en.md README.zh-CN.md compatibility.json dsh-codex.ps1 lib package.json pnpm-lock.yaml pnpm-workspace.yaml
           git commit -m "chore: support DSH $DSH_VERSION"
           git push origin HEAD:main
       - name: Dispatch and await the verified release workflow
