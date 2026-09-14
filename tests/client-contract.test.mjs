@@ -39,6 +39,21 @@ test('client is one removable DSH settings section, not a second application she
   assert.doesNotMatch(source, /createRoot|ReactDOM|index\.html|localStorage|sessionStorage|accessToken|refreshToken/)
 })
 
+test('the client RPC allow-list admits every endpoint the client calls', async () => {
+  const { RPC_ENDPOINTS, CHANNEL, createSubscriptionRpcClient } = await import('../src/rpc-contract.js')
+  // local sign-in import is served by src/subscription-rpc.js; without this entry the
+  // client rejects the call locally and the user only sees a generic failure.
+  assert.ok(RPC_ENDPOINTS.includes('local-auth/import'), 'local-auth/import must be callable')
+  const calls = []
+  const client = createSubscriptionRpcClient({
+    call: (...args) => { calls.push(args); return Promise.resolve({ ok: true, value: { reached: true } }) },
+  })
+  await client.call(CHANNEL, 'local-auth/import', {}, undefined)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0][1], 'codex-subscription/local-auth/import')
+  assert.throws(() => client.call(CHANNEL, 'local-auth/unknown', {}, undefined), /Invalid subscription RPC target/)
+})
+
 test('settings exposes one secret-free support diagnostic that can be copied deliberately', async () => {
   const source = await text('src/client.jsx')
   assert.match(source, /['"]diagnostics['"]/u)

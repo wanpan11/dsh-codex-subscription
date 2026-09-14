@@ -1,6 +1,6 @@
 export const CHANNEL = '/codex-subscription'
 export const RPC_ENDPOINTS = Object.freeze([
-  'status', 'login/start', 'login/status', 'login/submit', 'login/cancel', 'logout',
+  'status', 'login/start', 'login/status', 'login/submit', 'login/cancel', 'logout', 'local-auth/import',
   'account/select', 'account/remove', 'usage', 'diagnostics',
   'preferences/status', 'preferences/models', 'preferences/update',
   'reset-credit/inspect', 'reset-credit/prepare', 'reset-credit/consume',
